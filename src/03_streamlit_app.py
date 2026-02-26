@@ -63,14 +63,14 @@ def get_gemini_client():
 # ---------------------------------------------------------------------------
 # Startup validation
 # ---------------------------------------------------------------------------
-def validate_startup(client: QdrantClient) -> list[str]:
+def validate_startup(client: QdrantClient, gemini_client) -> list[str]:
     """Return a list of error strings. Empty list = all good."""
     errors = []
 
-    if not os.getenv("GOOGLE_API_KEY"):
+    if gemini_client is None:
         errors.append(
-            "GOOGLE_API_KEY is not set. Create a `.env` file with your Gemini API key "
-            "(copy `.env.example` as a starting point)."
+            "GOOGLE_API_KEY is not set or was not loaded. Create a `.env` file with your "
+            "Gemini API key (copy `.env.example`) and restart the app."
         )
 
     existing = {c.name for c in client.get_collections().collections}
@@ -208,7 +208,7 @@ def main():
     gemini_client = get_gemini_client()
 
     # Startup validation
-    errors = validate_startup(qdrant_client)
+    errors = validate_startup(qdrant_client, gemini_client)
     if errors:
         for err in errors:
             st.error(err)
