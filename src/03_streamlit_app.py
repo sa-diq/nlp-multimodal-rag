@@ -10,6 +10,11 @@ from qdrant_client import QdrantClient
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
+# Load environment (must happen before reading env vars)
+# ---------------------------------------------------------------------------
+load_dotenv()
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 DB_PATH = "./qdrant_db"
@@ -21,8 +26,8 @@ BGE_QUERY_PREFIX = "Represent this question for searching relevant passages: "
 TOP_K_TEXT = 3
 TOP_K_IMAGE = 2
 
-# Free vision-capable model on OpenRouter
-LLM_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"
+# Configurable via .env — go to https://openrouter.ai/models and filter Free + Vision
+LLM_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-11b-vision-instruct:free")
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant for the MG4 EV Owner's Manual. "
@@ -30,11 +35,6 @@ SYSTEM_PROMPT = (
     "If the context does not contain enough information, say so honestly. "
     "Always cite the page number(s) from the manual when you use information from them."
 )
-
-# ---------------------------------------------------------------------------
-# Load environment
-# ---------------------------------------------------------------------------
-load_dotenv()
 
 
 # ---------------------------------------------------------------------------
@@ -69,22 +69,21 @@ def get_llm_client():
 # ---------------------------------------------------------------------------
 # Startup validation
 # ---------------------------------------------------------------------------
-def validate_startup(client: QdrantClient, llm_client) -> list[str]:
-    """Return a list of error strings. Empty list = all good."""
+def validate_startup(qdrant_client: QdrantClient, llm_client) -> list[str]:
     errors = []
 
     if llm_client is None:
         errors.append(
-            "OPENROUTER_API_KEY is not set. Create a `.env` file with your OpenRouter API key "
-            "(copy `.env.example`) and restart the app."
+            "OPENROUTER_API_KEY is not set. Add it to your `.env` file "
+            "(see `.env.example`) and restart the app."
         )
 
-    existing = {c.name for c in client.get_collections().collections}
+    existing = {c.name for c in qdrant_client.get_collections().collections}
     for name in [TEXT_COLLECTION, IMAGE_COLLECTION]:
         if name not in existing:
             errors.append(
                 f"Qdrant collection `{name}` not found. "
-                "Run `python src/02_build_multimodal_index.py` first to build the index."
+                "Run `python src/02_build_multimodal_index.py` first."
             )
 
     return errors
@@ -94,67 +93,81 @@ def validate_startup(client: QdrantClient, llm_client) -> list[str]:
 # RAG pipeline
 # ---------------------------------------------------------------------------
 def retrieve_text(query: str, client: QdrantClient, text_model: SentenceTransformer):
-    """Encode query with BGE and search mg4_text."""
     vec = text_model.encode(
         BGE_QUERY_PREFIX + query,
         normalize_embeddings=True,
     ).tolist()
-    results = client.query_points(
+    return client.query_points(
         collection_name=TEXT_COLLECTION,
         query=vec,
         limit=TOP_K_TEXT,
         with_payload=True,
     ).points
-    return results
 
 
 def retrieve_images(query: str, client: QdrantClient, image_model: SentenceTransformer):
-    """Encode query with CLIP (cross-modal: text → image) and search mg4_image."""
     vec = image_model.encode(query, normalize_embeddings=True).tolist()
-    results = client.query_points(
+    return client.query_points(
         collection_name=IMAGE_COLLECTION,
         query=vec,
         limit=TOP_K_IMAGE,
         with_payload=True,
     ).points
-    return results
 
 
-def build_messages(query: str, text_hits, image_hits) -> list:
+def image_to_b64(pil_img: Image.Image) -> str:
+    buf = io.BytesIO()
+    pil_img.convert("RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def build_messages(
+    query: str,
+    text_hits,
+    image_hits,
+    user_image: Image.Image | None = None,
+) -> list:
     """
-    Build the OpenAI-compatible messages list.
-    Images are sent as base64 data URLs (supported by vision models on OpenRouter).
+    Build OpenAI-compatible messages.
+    - user_image: an optional PIL image uploaded by the user
+    - image_hits: CLIP-retrieved manual images (also sent to the LLM for context)
     """
     user_content = []
 
-    # Context text
+    # User-uploaded image goes first so the model sees it alongside the question
+    if user_image is not None:
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{image_to_b64(user_image)}"},
+        })
+
+    # Retrieved text context
     if text_hits:
         ctx_lines = []
         for i, hit in enumerate(text_hits, 1):
             page = hit.payload.get("page_label", "?")
             text = hit.payload.get("text", "")
             ctx_lines.append(f"[Context {i} — Page {page}]\n{text}")
-        context_block = "\n\n".join(ctx_lines)
-        user_content.append({"type": "text", "text": f"MANUAL CONTEXT:\n{context_block}"})
+        user_content.append({
+            "type": "text",
+            "text": f"MANUAL CONTEXT:\n" + "\n\n".join(ctx_lines),
+        })
 
-    # Images as base64 data URLs
+    # CLIP-retrieved manual images
     for hit in image_hits:
         filepath = hit.payload.get("filepath", "")
         if not filepath or not os.path.exists(filepath):
             continue
         try:
             img = Image.open(filepath).convert("RGB")
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode()
             user_content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "image_url": {"url": f"data:image/png;base64,{image_to_b64(img)}"},
             })
         except Exception:
-            pass  # Skip unreadable images silently
+            pass
 
-    # Question
+    # The actual question
     user_content.append({"type": "text", "text": f"USER QUESTION: {query}"})
 
     return [
@@ -163,19 +176,17 @@ def build_messages(query: str, text_hits, image_hits) -> list:
     ]
 
 
-def run_rag(query: str, client, text_model, image_model, llm_client) -> dict:
-    """
-    Full RAG pipeline. Returns:
-        {
-            "answer": str,
-            "text_hits": [...],
-            "image_hits": [...],
-        }
-    """
+def run_rag(
+    query: str,
+    client,
+    text_model,
+    image_model,
+    llm_client,
+    user_image: Image.Image | None = None,
+) -> dict:
     text_hits = retrieve_text(query, client, text_model)
     image_hits = retrieve_images(query, client, image_model)
-
-    messages = build_messages(query, text_hits, image_hits)
+    messages = build_messages(query, text_hits, image_hits, user_image)
 
     response = llm_client.chat.completions.create(
         model=LLM_MODEL,
@@ -202,7 +213,7 @@ def main():
     )
 
     st.title("🚗 MG4 EV Manual Assistant")
-    st.caption("Powered by OpenRouter (Llama 3.2 Vision) · BGE + CLIP embeddings · Qdrant")
+    st.caption(f"Powered by OpenRouter · `{LLM_MODEL}` · BGE + CLIP · Qdrant")
 
     # Load resources
     qdrant_client = get_qdrant_client()
@@ -235,10 +246,11 @@ def main():
 
         st.divider()
         st.caption(
-            "**Models used:**\n"
-            f"- Text: `BAAI/bge-small-en-v1.5`\n"
-            f"- Image: `clip-ViT-B-32`\n"
-            f"- LLM: `{LLM_MODEL}`"
+            "**Embedding models:**\n"
+            "- Text: `BAAI/bge-small-en-v1.5`\n"
+            "- Image: `clip-ViT-B-32`\n\n"
+            f"**LLM:** `{LLM_MODEL}`\n\n"
+            "To change the model, set `OPENROUTER_MODEL` in `.env` and restart."
         )
 
     # Chat history initialisation
@@ -248,6 +260,8 @@ def main():
     # Render existing chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
+            if msg.get("user_image_bytes"):
+                st.image(msg["user_image_bytes"], width=300)
             st.markdown(msg["content"])
             if msg["role"] == "assistant" and msg.get("pages"):
                 st.caption(f"Sources: pages {', '.join(msg['pages'])}")
@@ -258,11 +272,36 @@ def main():
                         if os.path.exists(path):
                             col.image(path, caption=f"Page {page}", use_container_width=True)
 
-    # Chat input
+    # Image upload + chat input
+    uploaded_file = st.file_uploader(
+        "Attach an image (optional)",
+        type=["jpg", "jpeg", "png", "webp"],
+        label_visibility="collapsed",
+        help="Upload a photo (e.g. dashboard warning light) to include in your question.",
+    )
+
+    user_image: Image.Image | None = None
+    if uploaded_file:
+        user_image = Image.open(uploaded_file).convert("RGB")
+        st.image(user_image, caption="Attached image", width=300)
+
     if prompt := st.chat_input("Ask anything about the MG4 EV…"):
+        # Capture uploaded image bytes for history rendering
+        user_image_bytes = None
+        if user_image is not None:
+            buf = io.BytesIO()
+            user_image.save(buf, format="PNG")
+            user_image_bytes = buf.getvalue()
+
         # Show user message
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        st.session_state.messages.append({
+            "role": "user",
+            "content": prompt,
+            "user_image_bytes": user_image_bytes,
+        })
         with st.chat_message("user"):
+            if user_image_bytes:
+                st.image(user_image_bytes, width=300)
             st.markdown(prompt)
 
         # Run RAG and show assistant response
@@ -275,6 +314,7 @@ def main():
                         text_model,
                         image_model,
                         llm_client,
+                        user_image=user_image,
                     )
                 except Exception as e:
                     st.error(f"Error generating response: {e}")
@@ -284,20 +324,15 @@ def main():
             text_hits = result["text_hits"]
             image_hits = result["image_hits"]
 
-            # Collect unique page labels from text hits
-            pages = list(
-                dict.fromkeys(
-                    hit.payload.get("page_label", "?") for hit in text_hits
-                )
-            )
+            pages = list(dict.fromkeys(
+                hit.payload.get("page_label", "?") for hit in text_hits
+            ))
 
-            # Collect image paths + page labels
-            image_paths = []
-            for hit in image_hits:
-                path = hit.payload.get("filepath", "")
-                page = hit.payload.get("page_label", "?")
-                if path and os.path.exists(path):
-                    image_paths.append((path, page))
+            image_paths = [
+                (hit.payload["filepath"], hit.payload.get("page_label", "?"))
+                for hit in image_hits
+                if hit.payload.get("filepath") and os.path.exists(hit.payload["filepath"])
+            ]
 
             st.markdown(answer)
 
