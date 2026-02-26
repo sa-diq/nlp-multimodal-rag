@@ -1,13 +1,13 @@
 import os
 import io
+import base64
 import streamlit as st
 from dotenv import load_dotenv
 from PIL import Image
 
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -20,6 +20,9 @@ BGE_QUERY_PREFIX = "Represent this question for searching relevant passages: "
 
 TOP_K_TEXT = 3
 TOP_K_IMAGE = 2
+
+# Free vision-capable model on OpenRouter
+LLM_MODEL = "google/gemini-2.0-flash-exp:free"
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant for the MG4 EV Owner's Manual. "
@@ -52,25 +55,28 @@ def get_image_model():
     return SentenceTransformer("clip-ViT-B-32")
 
 
-@st.cache_resource(show_spinner="Initializing Gemini client...")
-def get_gemini_client():
-    api_key = os.getenv("GOOGLE_API_KEY")
+@st.cache_resource(show_spinner="Initializing OpenRouter client...")
+def get_llm_client():
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
+    return OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Startup validation
 # ---------------------------------------------------------------------------
-def validate_startup(client: QdrantClient, gemini_client) -> list[str]:
+def validate_startup(client: QdrantClient, llm_client) -> list[str]:
     """Return a list of error strings. Empty list = all good."""
     errors = []
 
-    if gemini_client is None:
+    if llm_client is None:
         errors.append(
-            "GOOGLE_API_KEY is not set or was not loaded. Create a `.env` file with your "
-            "Gemini API key (copy `.env.example`) and restart the app."
+            "OPENROUTER_API_KEY is not set. Create a `.env` file with your OpenRouter API key "
+            "(copy `.env.example`) and restart the app."
         )
 
     existing = {c.name for c in client.get_collections().collections}
@@ -114,19 +120,14 @@ def retrieve_images(query: str, client: QdrantClient, image_model: SentenceTrans
     return results
 
 
-def build_gemini_contents(
-    query: str,
-    text_hits,
-    image_hits,
-) -> list:
+def build_messages(query: str, text_hits, image_hits) -> list:
     """
-    Build the `contents` list for the Gemini API call.
-    Structure: [system_part, context_text_part, ...image_parts, question_part]
+    Build the OpenAI-compatible messages list.
+    Images are sent as base64 data URLs (supported by vision models on OpenRouter).
     """
-    # System instruction as a text part
-    parts = [types.Part.from_text(text=SYSTEM_PROMPT)]
+    user_content = []
 
-    # Context text part
+    # Context text
     if text_hits:
         ctx_lines = []
         for i, hit in enumerate(text_hits, 1):
@@ -134,9 +135,9 @@ def build_gemini_contents(
             text = hit.payload.get("text", "")
             ctx_lines.append(f"[Context {i} — Page {page}]\n{text}")
         context_block = "\n\n".join(ctx_lines)
-        parts.append(types.Part.from_text(text=f"MANUAL CONTEXT:\n{context_block}"))
+        user_content.append({"type": "text", "text": f"MANUAL CONTEXT:\n{context_block}"})
 
-    # Image parts (inline bytes)
+    # Images as base64 data URLs
     for hit in image_hits:
         filepath = hit.payload.get("filepath", "")
         if not filepath or not os.path.exists(filepath):
@@ -145,20 +146,24 @@ def build_gemini_contents(
             img = Image.open(filepath).convert("RGB")
             buf = io.BytesIO()
             img.save(buf, format="PNG")
-            png_bytes = buf.getvalue()
-            parts.append(
-                types.Part.from_bytes(data=png_bytes, mime_type="image/png")
-            )
+            b64 = base64.b64encode(buf.getvalue()).decode()
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{b64}"},
+            })
         except Exception:
             pass  # Skip unreadable images silently
 
     # Question
-    parts.append(types.Part.from_text(text=f"USER QUESTION: {query}"))
+    user_content.append({"type": "text", "text": f"USER QUESTION: {query}"})
 
-    return [types.Content(role="user", parts=parts)]
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
 
-def run_rag(query: str, client, text_model, image_model, gemini_client) -> dict:
+def run_rag(query: str, client, text_model, image_model, llm_client) -> dict:
     """
     Full RAG pipeline. Returns:
         {
@@ -170,19 +175,17 @@ def run_rag(query: str, client, text_model, image_model, gemini_client) -> dict:
     text_hits = retrieve_text(query, client, text_model)
     image_hits = retrieve_images(query, client, image_model)
 
-    contents = build_gemini_contents(query, text_hits, image_hits)
+    messages = build_messages(query, text_hits, image_hits)
 
-    response = gemini_client.models.generate_content(
-        model="gemini-2.0-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=1024,
-        ),
+    response = llm_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1024,
     )
 
     return {
-        "answer": response.text,
+        "answer": response.choices[0].message.content,
         "text_hits": text_hits,
         "image_hits": image_hits,
     }
@@ -199,16 +202,16 @@ def main():
     )
 
     st.title("🚗 MG4 EV Manual Assistant")
-    st.caption("Powered by Gemini 2.0 Flash · BGE + CLIP embeddings · Qdrant")
+    st.caption("Powered by OpenRouter · BGE + CLIP embeddings · Qdrant")
 
     # Load resources
     qdrant_client = get_qdrant_client()
     text_model = get_text_model()
     image_model = get_image_model()
-    gemini_client = get_gemini_client()
+    llm_client = get_llm_client()
 
     # Startup validation
-    errors = validate_startup(qdrant_client, gemini_client)
+    errors = validate_startup(qdrant_client, llm_client)
     if errors:
         for err in errors:
             st.error(err)
@@ -233,9 +236,9 @@ def main():
         st.divider()
         st.caption(
             "**Models used:**\n"
-            "- Text: `BAAI/bge-small-en-v1.5`\n"
-            "- Image: `clip-ViT-B-32`\n"
-            "- LLM: `gemini-2.0-flash`"
+            f"- Text: `BAAI/bge-small-en-v1.5`\n"
+            f"- Image: `clip-ViT-B-32`\n"
+            f"- LLM: `{LLM_MODEL}`"
         )
 
     # Chat history initialisation
@@ -271,7 +274,7 @@ def main():
                         qdrant_client,
                         text_model,
                         image_model,
-                        gemini_client,
+                        llm_client,
                     )
                 except Exception as e:
                     st.error(f"Error generating response: {e}")
