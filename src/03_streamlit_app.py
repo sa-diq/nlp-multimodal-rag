@@ -93,24 +93,24 @@ def retrieve_text(query: str, client: QdrantClient, text_model: SentenceTransfor
         BGE_QUERY_PREFIX + query,
         normalize_embeddings=True,
     ).tolist()
-    results = client.search(
+    results = client.query_points(
         collection_name=TEXT_COLLECTION,
-        query_vector=vec,
+        query=vec,
         limit=TOP_K_TEXT,
         with_payload=True,
-    )
+    ).points
     return results
 
 
 def retrieve_images(query: str, client: QdrantClient, image_model: SentenceTransformer):
     """Encode query with CLIP (cross-modal: text → image) and search mg4_image."""
     vec = image_model.encode(query, normalize_embeddings=True).tolist()
-    results = client.search(
+    results = client.query_points(
         collection_name=IMAGE_COLLECTION,
-        query_vector=vec,
+        query=vec,
         limit=TOP_K_IMAGE,
         with_payload=True,
-    )
+    ).points
     return results
 
 
