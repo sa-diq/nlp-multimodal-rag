@@ -22,7 +22,7 @@ TOP_K_TEXT = 3
 TOP_K_IMAGE = 2
 
 # Free vision-capable model on OpenRouter
-LLM_MODEL = "google/gemini-2.0-flash-exp:free"
+LLM_MODEL = "meta-llama/llama-3.2-11b-vision-instruct:free"
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant for the MG4 EV Owner's Manual. "
@@ -202,7 +202,7 @@ def main():
     )
 
     st.title("🚗 MG4 EV Manual Assistant")
-    st.caption("Powered by OpenRouter · BGE + CLIP embeddings · Qdrant")
+    st.caption("Powered by OpenRouter (Llama 3.2 Vision) · BGE + CLIP embeddings · Qdrant")
 
     # Load resources
     qdrant_client = get_qdrant_client()
