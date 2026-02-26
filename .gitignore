@@ -212,4 +212,5 @@ qdrant_db/
 
 # VScode
 .vscode/
+.claude/
 

@@ -21,13 +21,11 @@ DB_PATH = "./qdrant_db"
 TEXT_COLLECTION = "mg4_text"
 IMAGE_COLLECTION = "mg4_image"
 
-BGE_QUERY_PREFIX = "Represent this question for searching relevant passages: "
-
 TOP_K_TEXT = 3
 TOP_K_IMAGE = 2
 
 # Configurable via .env — go to https://openrouter.ai/models and filter Free + Vision
-LLM_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.2-11b-vision-instruct:free")
+LLM_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.5-flash-02-23")
 
 SYSTEM_PROMPT = (
     "You are a helpful assistant for the MG4 EV Owner's Manual. "
@@ -45,13 +43,8 @@ def get_qdrant_client():
     return QdrantClient(path=DB_PATH)
 
 
-@st.cache_resource(show_spinner="Loading text embedding model (BGE)...")
-def get_text_model():
-    return SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-
-@st.cache_resource(show_spinner="Loading image embedding model (CLIP)...")
-def get_image_model():
+@st.cache_resource(show_spinner="Loading embedding model (CLIP)...")
+def get_embed_model():
     return SentenceTransformer("clip-ViT-B-32")
 
 
@@ -75,7 +68,7 @@ def validate_startup(qdrant_client: QdrantClient, llm_client) -> list[str]:
     if llm_client is None:
         errors.append(
             "OPENROUTER_API_KEY is not set. Add it to your `.env` file "
-            "(see `.env.example`) and restart the app."
+            "and restart the app."
         )
 
     existing = {c.name for c in qdrant_client.get_collections().collections}
@@ -92,11 +85,8 @@ def validate_startup(qdrant_client: QdrantClient, llm_client) -> list[str]:
 # ---------------------------------------------------------------------------
 # RAG pipeline
 # ---------------------------------------------------------------------------
-def retrieve_text(query: str, client: QdrantClient, text_model: SentenceTransformer):
-    vec = text_model.encode(
-        BGE_QUERY_PREFIX + query,
-        normalize_embeddings=True,
-    ).tolist()
+def retrieve_text(query: str, client: QdrantClient, model: SentenceTransformer):
+    vec = model.encode(query, normalize_embeddings=True).tolist()
     return client.query_points(
         collection_name=TEXT_COLLECTION,
         query=vec,
@@ -105,8 +95,8 @@ def retrieve_text(query: str, client: QdrantClient, text_model: SentenceTransfor
     ).points
 
 
-def retrieve_images(query: str, client: QdrantClient, image_model: SentenceTransformer):
-    vec = image_model.encode(query, normalize_embeddings=True).tolist()
+def retrieve_images(query: str, client: QdrantClient, model: SentenceTransformer):
+    vec = model.encode(query, normalize_embeddings=True).tolist()
     return client.query_points(
         collection_name=IMAGE_COLLECTION,
         query=vec,
@@ -179,13 +169,12 @@ def build_messages(
 def run_rag(
     query: str,
     client,
-    text_model,
-    image_model,
+    model,
     llm_client,
     user_image: Image.Image | None = None,
 ) -> dict:
-    text_hits = retrieve_text(query, client, text_model)
-    image_hits = retrieve_images(query, client, image_model)
+    text_hits = retrieve_text(query, client, model)
+    image_hits = retrieve_images(query, client, model)
     messages = build_messages(query, text_hits, image_hits, user_image)
 
     response = llm_client.chat.completions.create(
@@ -213,12 +202,11 @@ def main():
     )
 
     st.title("🚗 MG4 EV Manual Assistant")
-    st.caption(f"Powered by OpenRouter · `{LLM_MODEL}` · BGE + CLIP · Qdrant")
+    st.caption(f"Powered by OpenRouter · `{LLM_MODEL}` · CLIP · Qdrant")
 
     # Load resources
     qdrant_client = get_qdrant_client()
-    text_model = get_text_model()
-    image_model = get_image_model()
+    embed_model = get_embed_model()
     llm_client = get_llm_client()
 
     # Startup validation
@@ -246,11 +234,9 @@ def main():
 
         st.divider()
         st.caption(
-            "**Embedding models:**\n"
-            "- Text: `BAAI/bge-small-en-v1.5`\n"
-            "- Image: `clip-ViT-B-32`\n\n"
+            "**Embedding model:** `clip-ViT-B-32` (text + image)\n\n"
             f"**LLM:** `{LLM_MODEL}`\n\n"
-            "To change the model, set `OPENROUTER_MODEL` in `.env` and restart."
+            "To change the LLM, set `OPENROUTER_MODEL` in `.env` and restart."
         )
 
     # Chat history initialisation
@@ -311,8 +297,7 @@ def main():
                     result = run_rag(
                         prompt,
                         qdrant_client,
-                        text_model,
-                        image_model,
+                        embed_model,
                         llm_client,
                         user_image=user_image,
                     )

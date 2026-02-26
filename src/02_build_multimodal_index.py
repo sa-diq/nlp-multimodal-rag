@@ -21,12 +21,8 @@ MIN_IMAGE_DIM = 200
 # Citation adjustment (0 = no offset)
 PAGE_OFFSET = 0
 
-# Embedding dimensions
-TEXT_DIM = 384   # BAAI/bge-small-en-v1.5
-IMAGE_DIM = 512  # clip-ViT-B-32
-
-# BGE prefix for indexing passages
-BGE_PASSAGE_PREFIX = "Represent this sentence for searching relevant passages: "
+# Single embedding dimension — CLIP ViT-B/32 shared text+image space
+EMBED_DIM = 512  # clip-ViT-B-32
 
 
 def extract_images_from_pdf(pdf_path, output_dir):
@@ -131,25 +127,25 @@ def create_qdrant_collections(client):
 
     client.create_collection(
         collection_name="mg4_text",
-        vectors_config=VectorParams(size=TEXT_DIM, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
     )
-    print(f"  Created collection: mg4_text (dim={TEXT_DIM})")
+    print(f"  Created collection: mg4_text (dim={EMBED_DIM})")
 
     client.create_collection(
         collection_name="mg4_image",
-        vectors_config=VectorParams(size=IMAGE_DIM, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
     )
-    print(f"  Created collection: mg4_image (dim={IMAGE_DIM})")
+    print(f"  Created collection: mg4_image (dim={EMBED_DIM})")
 
 
 def embed_and_upsert_text(client, text_chunks, model, batch_size=32):
-    """Embed text chunks in batches and upsert to mg4_text collection."""
+    """Embed text chunks with CLIP in batches and upsert to mg4_text collection."""
     print(f"\nEmbedding {len(text_chunks)} text chunks (batch={batch_size})...")
     points = []
 
     for i in tqdm(range(0, len(text_chunks), batch_size), desc="Text batches"):
         batch = text_chunks[i : i + batch_size]
-        texts = [BGE_PASSAGE_PREFIX + chunk["text"] for chunk in batch]
+        texts = [chunk["text"] for chunk in batch]
         embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
 
         for chunk, vec in zip(batch, embeddings):
@@ -171,7 +167,7 @@ def embed_and_upsert_text(client, text_chunks, model, batch_size=32):
 
 
 def embed_and_upsert_images(client, image_dicts, model):
-    """Embed images one-by-one with CLIP and upsert to mg4_image collection."""
+    """Embed images with CLIP and upsert to mg4_image collection."""
     print(f"\nEmbedding {len(image_dicts)} images with CLIP...")
     points = []
 
@@ -205,13 +201,10 @@ def build_index():
     # 2. Extract text from PDF
     text_chunks = extract_text_from_pdf(PDF_PATH)
 
-    # 3. Load embedding models (downloads on first run, then cached)
-    print("\nLoading embedding models...")
-    print("  Loading BGE-small (text)...")
-    text_model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-
-    print("  Loading CLIP ViT-B/32 (image)...")
-    image_model = SentenceTransformer("clip-ViT-B-32")
+    # 3. Load embedding model (downloads on first run, then cached)
+    print("\nLoading embedding model...")
+    print("  Loading CLIP ViT-B/32 (text + image)...")
+    model = SentenceTransformer("clip-ViT-B-32")
 
     # 4. Initialize Qdrant and create collections
     print("\nInitializing Qdrant...")
@@ -219,10 +212,10 @@ def build_index():
     create_qdrant_collections(client)
 
     # 5. Embed and upsert text
-    n_text = embed_and_upsert_text(client, text_chunks, text_model)
+    n_text = embed_and_upsert_text(client, text_chunks, model)
 
     # 6. Embed and upsert images
-    n_images = embed_and_upsert_images(client, image_dicts, image_model)
+    n_images = embed_and_upsert_images(client, image_dicts, model)
 
     # 7. Verification
     print("\n--- Indexing Complete ---")
